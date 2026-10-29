@@ -238,6 +238,7 @@ const addAnonymousConnection = (anonymousId: string, socketId: string) => {
     const prevCount = anonymousConnectionCounts.get(prev) ?? 0
     if (prevCount <= 1) {
       anonymousConnectionCounts.delete(prev)
+      void updateLastSeenAt(prev)
     } else {
       anonymousConnectionCounts.set(prev, prevCount - 1)
     }
@@ -246,6 +247,7 @@ const addAnonymousConnection = (anonymousId: string, socketId: string) => {
   const next = (anonymousConnectionCounts.get(anonymousId) ?? 0) + 1
   anonymousConnectionCounts.set(anonymousId, next)
   anonymousSockets.set(socketId, anonymousId)
+  if (next === 1) void updateLastSeenAt(anonymousId)
 }
 
 const removeAnonymousConnectionBySocket = (socketId: string) => {
@@ -264,6 +266,7 @@ const removeAnonymousConnectionBySocket = (socketId: string) => {
   const next = current - 1
   if (next <= 0) {
     anonymousConnectionCounts.delete(anonymousId)
+    void updateLastSeenAt(anonymousId)
   } else {
     anonymousConnectionCounts.set(anonymousId, next)
   }
@@ -343,6 +346,7 @@ setInterval(() => {
   anonymousConnectionCounts.forEach((_, anonId) => {
     if (!activeAnonymousSockets.has(anonId)) {
       anonymousConnectionCounts.delete(anonId)
+      void updateLastSeenAt(anonId)
       cleaned = true
     }
   })
@@ -359,13 +363,36 @@ const emitPresenceSnapshot = () => {
   const anonymousCount = anonymousConnectionCounts.size
   io.emit('online-users', {
     userIds: Array.from(onlineUsers.keys()),
+    anonymousIds: Array.from(anonymousConnectionCounts.keys()),
     userCount: onlineUsers.size,
     anonymousCount,
     total: activeSocketCount
   })
 }
 
+interface ChatAuthor {
+  id: string
+  username: string
+  avatarUrl?: string | null
+  isAnonymous: boolean
+}
+
 io.on('connection', (socket) => {
+  // Share short-lived verification between typing events and message sends.
+  let chatAuth: { token: string; expiresAt: number; author: Promise<ChatAuthor | null> } | null = null
+  const getChatAuthor = async (token?: string): Promise<ChatAuthor | null> => {
+    if (typeof token !== 'string' || !token) return null
+    if (!chatAuth || chatAuth.token !== token || chatAuth.expiresAt <= Date.now()) {
+      const author = axios.get<ChatAuthor>(`${API_URL}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 5000,
+      }).then(({ data }) => data.id && !data.isAnonymous ? data : null).catch(() => null)
+      chatAuth = { token, expiresAt: Date.now() + 30_000, author }
+    }
+    const author = await chatAuth.author
+    if (!socket.connected || !author || socketUserMap.get(socket.id) !== author.id || anonymousSockets.has(socket.id)) return null
+    return author
+  }
   emitPresenceSnapshot()
   
   // Online sessions are owned exclusively by connected clients.
@@ -415,37 +442,16 @@ io.on('connection', (socket) => {
     emitPresenceSnapshot()
   })
 
-  socket.on('chat-send', (payload: { text: string; userId?: string | null; username?: string; avatarUrl?: string | null; roomId?: string | null }) => {
-      const normalizedRoomId = normalizeRoomId(payload?.roomId ?? null)
+  socket.on('chat-send', async (payload: { text: string; token?: string; roomId?: string | null }) => {
+    const normalizedRoomId = normalizeRoomId(payload?.roomId ?? null)
     const rawText = (payload?.text ?? '').toString().slice(0, 1000)
     if (!rawText.trim()) return
 
-    const userId = socketUserMap.get(socket.id) ?? payload?.userId ?? null
-    const anonymousId = anonymousSockets.get(socket.id)
-
-    const payloadUsername = payload?.username?.toString().slice(0, 100) || undefined
-    const payloadAvatar = payload?.avatarUrl || undefined
-
-    let username = payloadUsername || 'Guest'
-    let avatarUrl: string | undefined = payloadAvatar || undefined
-
-    if (userId) {
-      const mappedUsername = userNames.get(userId)
-      const mappedAvatar = userAvatars.get(userId)
-
-      username = mappedUsername || payloadUsername || `User-${userId.slice(0, 6)}`
-      avatarUrl = mappedAvatar || payloadAvatar || undefined
-
-      // Refresh maps if client sent updated data
-      if (payloadUsername) {
-        userNames.set(userId, payloadUsername)
-      }
-      if (payloadAvatar) {
-        userAvatars.set(userId, payloadAvatar)
-      }
-    } else if (anonymousId) {
-      username = `Guest-${anonymousId.slice(-4)}`
-    }
+    const author = await getChatAuthor(payload?.token)
+    if (!author) return
+    const userId = author.id
+    const username = author.username
+    const avatarUrl = author.avatarUrl || undefined
 
     const localMessage: ChatMessage = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -469,28 +475,10 @@ io.on('connection', (socket) => {
     socket.emit('chat-history', getChatHistoryForRoom(roomId))
   })
 
-  socket.on('chat-typing', (payload: { isTyping: boolean; userId?: string | null; username?: string; avatarUrl?: string | null; roomId?: string | null }) => {
-    const userId = socketUserMap.get(socket.id) ?? payload?.userId ?? null
-    const anonymousId = anonymousSockets.get(socket.id)
-    const payloadUsername = payload?.username?.toString().slice(0, 100) || undefined
-    const payloadAvatar = payload?.avatarUrl || undefined
-
-    let username = payloadUsername || 'Guest'
-
-    if (userId) {
-      const mappedUsername = userNames.get(userId)
-      username = mappedUsername || payloadUsername || `User-${userId.slice(0, 6)}`
-
-      // Keep cache fresh if client sent data
-      if (payloadUsername) {
-        userNames.set(userId, payloadUsername)
-      }
-      if (payloadAvatar) {
-        userAvatars.set(userId, payloadAvatar)
-      }
-    } else if (anonymousId) {
-      username = `Guest-${anonymousId.slice(-4)}`
-    }
+  socket.on('chat-typing', async (payload: { isTyping: boolean; token?: string; roomId?: string | null }) => {
+    const author = await getChatAuthor(payload?.token)
+    if (!author) return
+    const username = author.username
     const roomId = normalizeRoomId(payload?.roomId ?? null)
     socket.broadcast.emit('chat-typing', {
       username,
@@ -659,10 +647,37 @@ io.on('connection', (socket) => {
     io.emit('session-update', serializeSessions())
   })
 
-  socket.on('session-sync', (sessionData: PomodoroSession) => {
+  socket.on('session-sync', async (payload: PomodoroSession & { token?: string }) => {
+    // Keep credentials out of stored sessions and broadcasts.
+    const { token, ...sessionData } = payload
     const ownerId = socketUserMap.get(socket.id) ?? anonymousSockets.get(socket.id)
     const existingOwner = sessionActivity.get(sessionData.id)?.session.userId ?? sessions.get(sessionData.id)?.userId
-    if (sessionData.userId !== ownerId || (existingOwner && existingOwner !== ownerId) || endOperations.has(sessionData.id)) return
+    if (!ownerId || sessionData.userId !== ownerId || endOperations.has(sessionData.id)) return
+    if (existingOwner && existingOwner !== ownerId) {
+      if (!existingOwner.startsWith('anon_') || !token) return
+      const author = await getChatAuthor(token)
+      if (!author || author.id !== ownerId) return
+      // Registration changes the database owner. Verify it before transferring cache ownership.
+      const ownedSessions = await axios.get<Array<{ id: string; userId: string }>>(`${API_URL}/api/sessions?activeOnly=1`, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 5000,
+      }).then(({ data }) => data).catch(() => [])
+      if (!socket.connected || socketUserMap.get(socket.id) !== ownerId ||
+          !ownedSessions.some(session => session.id === sessionData.id && session.userId === ownerId) ||
+          endOperations.has(sessionData.id)) return
+      const activity = sessionActivity.get(sessionData.id)
+      if (activity) {
+        activity.session = { ...activity.session, userId: ownerId, username: author.username, avatarUrl: author.avatarUrl ?? undefined }
+      }
+      for (const history of chatMessagesByRoom.values()) {
+        for (const message of history) {
+          if (message.userId !== existingOwner) continue
+          message.userId = ownerId
+          message.username = author.username
+          message.avatarUrl = author.avatarUrl ?? undefined
+        }
+      }
+    }
     // Remove any existing sessions for this user/socket to prevent duplicates
     const userId = sessionData.userId || (socketUserMap.get(socket.id) ?? null)
     const anonymousId = anonymousSockets.get(socket.id)
@@ -846,6 +861,7 @@ io.on('connection', (socket) => {
     const anonymousCount = anonymousConnectionCounts.size
     socket.emit('online-users', {
       userIds: Array.from(onlineUsers.keys()),
+      anonymousIds: Array.from(anonymousConnectionCounts.keys()),
       userCount: onlineUsers.size,
       anonymousCount,
       total: onlineUsers.size + anonymousCount
