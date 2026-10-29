@@ -938,7 +938,7 @@ io.on('connection', (socket) => {
       presenceToken: payload?.session?.presenceToken,
     }),
     (payload, session) => session ? { sessionId: session.id, session,
-      reason: session.status === 'COMPLETED' ? 'completed' : 'manual', removeActivity: payload.removeActivity === true } : null,
+      reason: session.status === 'COMPLETED' ? 'completed' as const : 'manual' as const, removeActivity: payload.removeActivity === true } : null,
     async (payload, operationToken) => {
     const sessionId = payload?.sessionId
     const reason = payload?.reason ?? 'manual'
